@@ -1,0 +1,90 @@
+# syntax=docker/dockerfile:1
+# =============================================================================
+# cognee-mcp — MINIMAL, OpenAI-only image.   Stock cognee-mcp image ~17.9 GB → ~0.9 GB.
+# =============================================================================
+# How the size comes down (all vs the stock cognee-mcp/Dockerfile):
+#   1. deps = core `cognee` only (pyproject.minimal.toml) — drops the [docs] extra
+#      (unstructured + onnxruntime, multi-GB), [neo4j], [postgres-binary], and the
+#      60 MB `uv` runtime dep. Core already ships kuzu + lancedb + sqlite + OpenAI.
+#   2. builder and runtime share ${PYTHON_BASE}, and runtime keeps its OWN python —
+#      we copy only the built venv+app, NOT /usr/local (which carried the uv binary).
+#   3. non-root user created BEFORE the copy → a single `COPY --chown` owns /app in
+#      one layer, avoiding the stock image's duplicate ~8.9 GB `chown -R /app`.
+#   4. no `.so` strip (it corrupts libscipy_openblas); bytecode caches dropped.
+#
+# Build from the repo root:
+#   docker build -f cognee-mcp/Dockerfile.minimal -t cognee-mcp:minimal .
+# =============================================================================
+
+# Pinned bases — bump deliberately. Builder + runtime MUST share PYTHON_BASE so the
+# venv's interpreter symlinks resolve at runtime (uv-multistage "same base" rule).
+ARG PYTHON_BASE=python:3.12-slim-bookworm
+ARG NODE_BASE=node:22-alpine
+# uv is the build-time resolver only; repo requires >=0.6.3,<1.0.0. Pin latest stable.
+ARG UV_TAG=0.11.26
+
+# -----------------------------------------------------------------------------
+# Stage 1 — app-bundle: build the MCP visualize-graph UI (React/Vite).
+# Vite writes to ../src/app_bundles relative to apps-src.
+# -----------------------------------------------------------------------------
+FROM ${NODE_BASE} AS app-bundle
+WORKDIR /build/cognee-mcp/apps-src
+COPY cognee-mcp/apps-src/package.json cognee-mcp/apps-src/package-lock.json ./
+RUN npm ci
+COPY cognee-mcp/apps-src ./
+RUN npm run build
+
+# -----------------------------------------------------------------------------
+# Stage 2 — builder: resolve + install the minimal deps into /app/.venv.
+# -----------------------------------------------------------------------------
+FROM ${PYTHON_BASE} AS builder
+# Pinned uv binary from the distroless image (no version drift, ~tiny copy).
+COPY --from=ghcr.io/astral-sh/uv:0.11.26 /uv /bin/uv
+WORKDIR /app
+ENV UV_LINK_MODE=copy \
+    UV_PYTHON_DOWNLOADS=never \
+    UV_COMPILE_BYTECODE=0
+# build-essential: compile any core dep lacking a wheel. Confined to this stage.
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential \
+    && rm -rf /var/lib/apt/lists/*
+# Source in, assert the MINIMAL pyproject, drop the stock lock (it pins the full
+# extra set) so uv resolves the reduced set fresh. Freshly built UI bundle shadows
+# the gitignored/empty dir.
+COPY cognee-mcp/ /app/
+COPY cognee-mcp/pyproject.minimal.toml /app/pyproject.toml
+COPY --from=app-bundle /build/cognee-mcp/src/app_bundles /app/src/app_bundles
+RUN rm -f /app/uv.lock
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --no-dev --no-editable
+# Drop bytecode caches (safe). Do NOT `strip` .so — the lance/pyarrow/scipy wheels
+# ship already-stripped, and `strip --strip-unneeded` corrupts libscipy_openblas.
+RUN find /app/.venv -depth -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true; \
+    find /app/.venv -name '*.pyc' -delete 2>/dev/null || true
+
+# -----------------------------------------------------------------------------
+# Stage 3 — runtime: same base, own python; copy only the built venv+app.
+# -----------------------------------------------------------------------------
+FROM ${PYTHON_BASE} AS runtime
+WORKDIR /app
+# Non-root user created FIRST so the single COPY --chown below owns /app in one layer.
+RUN groupadd --system --gid 1000 cognee \
+    && useradd --system --uid 1000 --gid cognee --no-create-home --shell /usr/sbin/nologin cognee
+COPY --from=builder --chown=cognee:cognee /app /app
+RUN sed -i 's/\r$//' /app/entrypoint.sh && chmod +x /app/entrypoint.sh
+ENV PATH="/app/.venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    HOME=/app
+LABEL org.opencontainers.image.title="cognee-mcp-minimal" \
+      org.opencontainers.image.description="Cognee MCP server — minimal OpenAI-only build (cognee core; no docs/neo4j/postgres/local-ML)" \
+      org.opencontainers.image.source="https://github.com/jugrajsingh/cognee" \
+      org.opencontainers.image.base.name="docker.io/library/python:3.12-slim-bookworm" \
+      org.opencontainers.image.licenses="Apache-2.0"
+USER cognee
+# Pre-bake Kuzu/Ladybug's JSON extension (best-effort; installs on first run if absent).
+RUN python -c "from cognee_db_workers._kuzu_helpers import install_json_extension_local; install_json_extension_local(buffer_pool_size=268435456)" \
+    || echo "WARNING: JSON extension pre-install skipped (installs on first run with network)."
+# No HEALTHCHECK is baked in on purpose: this image runs BOTH stdio (no port) and
+# http transports; a port-based healthcheck would wrongly mark stdio containers
+# unhealthy. The HTTP deployment defines its own healthcheck in docker-compose.
+ENTRYPOINT ["/app/entrypoint.sh"]

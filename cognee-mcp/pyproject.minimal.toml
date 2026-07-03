@@ -1,0 +1,45 @@
+[project]
+name = "cognee-mcp"
+version = "0.5.4"
+description = "Cognee MCP server — minimal OpenAI-only build (no docs/neo4j/postgres extras)"
+readme = "README.md"
+requires-python = ">=3.10"
+
+# Minimal dependency set for the OpenAI-embeddings + embedded-store path.
+# Core `cognee` already ships kuzu/ladybug (graph), lancedb (vector),
+# aiosqlite (relational), openai + litellm + tiktoken. We deliberately DROP:
+#   - docs           -> unstructured -> onnxruntime + heavy ML (multi-GB), only
+#                       needed for rich document parsing (pdf/docx/pptx). Our
+#                       ingest passes plain text, so it is never exercised.
+#   - neo4j          -> alternate graph backend (we use the default kuzu).
+#   - postgres-binary-> alternate relational backend (we use the default sqlite).
+#   - uv (runtime)   -> a 60 MB standalone binary the MCP server only calls when
+#                       the EXTRAS env var is set (optional-dep install at start).
+#                       We never set EXTRAS, so it is dead weight in the image.
+#                       (Build-time resolution uses the builder image's uv.)
+dependencies = [
+    "cognee>=1.1.0,<2.0.0",
+    "mcp>=1.12.0,<2.0.0",
+    "httpx>=0.27.0,<1.0.0",
+]
+
+authors = [
+    { name = "Boris Arzentar", email = "boris@topoteretes.com" },
+    { name = "Igor Ilic", email = "igor@topoteretes.com" },
+    { name = "Laszlo Hajdu", email = "laszlo@topoteretes.com" },
+]
+
+[build-system]
+requires = [ "hatchling", ]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+artifacts = ["src/app_bundles/**/*"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[project.scripts]
+cognee = "src:main"
+cognee-mcp = "src:main_mcp"
